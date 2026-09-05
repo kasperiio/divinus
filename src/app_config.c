@@ -98,11 +98,16 @@ int app_config_save(void) {
     fprintf(file, "  enable: %s\n", app_config.night_mode_enable ? "true" : "false");
     fprintf(file, "  ir_sensor_pin: %d\n", app_config.ir_sensor_pin);
     fprintf(file, "  check_interval_s: %d\n", app_config.check_interval_s);
+    if (app_config.smartir_gain_night || app_config.smartir_gain_day) {
+        fprintf(file, "  smartir_gain_night: %d\n", app_config.smartir_gain_night);
+        fprintf(file, "  smartir_gain_day: %d\n", app_config.smartir_gain_day);
+    }
     fprintf(file, "  ir_cut_pin1: %d\n", app_config.ir_cut_pin1);
     fprintf(file, "  ir_cut_pin2: %d\n", app_config.ir_cut_pin2);
     fprintf(file, "  ir_led_pin: %d\n", app_config.ir_led_pin);
     fprintf(file, "  pin_switch_delay_us: %d\n", app_config.pin_switch_delay_us);
     fprintf(file, "  adc_device: %s\n", app_config.adc_device);
+    fprintf(file, "  lamp: %s\n", app_config.night_lamp);
     fprintf(file, "  adc_threshold: %d\n", app_config.adc_threshold);
 
     fprintf(file, "isp:\n");
@@ -277,6 +282,7 @@ enum ConfigError app_config_parse(void) {
     app_config.pin_switch_delay_us = 250;
     app_config.check_interval_s = 10;
     app_config.adc_device[0] = 0;
+    strcpy(app_config.night_lamp, "ir");
     app_config.adc_threshold = 128;
 
     struct IniConfig ini;
@@ -344,11 +350,17 @@ enum ConfigError app_config_parse(void) {
     #define PIN_MAX 95
     if (app_config.night_mode_enable) {
         parse_int(
-            &ini, "night_mode", "ir_sensor_pin", 0, PIN_MAX,
+            &ini, "night_mode", "ir_sensor_pin", 0, 999, /* 999 = no sensor (the default) */
             &app_config.ir_sensor_pin);
         parse_int(
             &ini, "night_mode", "check_interval_s", 0, 600,
             &app_config.check_interval_s);
+        parse_int(
+            &ini, "night_mode", "smartir_gain_night", 0, 65535,
+            &app_config.smartir_gain_night);
+        parse_int(
+            &ini, "night_mode", "smartir_gain_day", 0, 65535,
+            &app_config.smartir_gain_day);
         parse_int(
             &ini, "night_mode", "ir_cut_pin1", 0, PIN_MAX,
             &app_config.ir_cut_pin1);
@@ -363,6 +375,8 @@ enum ConfigError app_config_parse(void) {
             &app_config.pin_switch_delay_us);
         parse_param_value(
             &ini, "night_mode", "adc_device", app_config.adc_device);
+        parse_param_value(
+            &ini, "night_mode", "lamp", app_config.night_lamp);
         parse_int(
             &ini, "night_mode", "adc_threshold", INT_MIN, INT_MAX,
             &app_config.adc_threshold);
