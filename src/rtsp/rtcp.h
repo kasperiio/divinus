@@ -20,9 +20,6 @@ static inline int __rtcp_send_sr(struct connection_item_t *con, int track_id);
  ******************************************************************************/
 static inline int __rtcp_send_sr(struct connection_item_t *con, int track_id)
 {
-    /* A track without a transport (never SETUP) has fd 0, which is stdin */
-    if (!con->trans[track_id].server_port_rtp && !con->trans[track_id].is_tcp) return SUCCESS;
-
     struct timeval tv;
     unsigned int ts_h, ts_l;
     int send_bytes;
@@ -33,6 +30,10 @@ static inline int __rtcp_send_sr(struct connection_item_t *con, int track_id)
         track_id < (int)(sizeof(con->trans) / sizeof(con->trans[0])),
         return FAILURE);
     t = &con->trans[track_id];
+
+    /* A track that was never SETUP has no transport, and its fd is 0 - stdin.
+     * Checked after the bounds assertion so an invalid id cannot index first. */
+    if (!t->server_port_rtp && !t->is_tcp) return SUCCESS;
 
     ASSERT(gettimeofday(&tv,NULL) == 0, return FAILURE);
 

@@ -549,6 +549,7 @@ int media_mjpeg_enable(void) {
     if (ret = create_channel(index, app_config.mjpeg_width,
         app_config.mjpeg_height, app_config.mjpeg_fps, 1))
     {
+        /* nothing was created yet, so only the slot needs releasing */
         chnState[index].enable = false;
         HAL_ERROR("media", "Creating channel %d failed with %#x!\n%s\n",
             index, ret, errstr(ret));
@@ -586,6 +587,11 @@ int media_mjpeg_enable(void) {
 
         if (ret)
         {
+            /* The channel was created; release it before clearing the slot.
+             * media_*_disable() skips slots whose enable is already clear, so
+             * dropping the flag first would strand the channel in the HAL and
+             * still let take_next_free_channel() hand the index out again. */
+            media_video_disable(index, 1);
             chnState[index].enable = false;
             HAL_ERROR("media", "Creating encoder %d failed with %#x!\n%s\n",
                 index, ret, errstr(ret));
@@ -594,6 +600,9 @@ int media_mjpeg_enable(void) {
 
     if (ret = bind_channel(index, app_config.mjpeg_fps, 1))
     {
+        /* channel and encoder exist and nothing is bound, so drop the encoder
+         * (the teardown order in media_*_disable) before releasing the slot */
+        media_video_disable(index, 1);
         chnState[index].enable = false;
         HAL_ERROR("media", "Binding channel %d failed with %#x!\n%s\n",
             index, ret, errstr(ret));
@@ -630,6 +639,7 @@ int media_mp4_enable(void) {
     if (ret = create_channel(index, app_config.mp4_width,
         app_config.mp4_height, app_config.mp4_fps, 0))
     {
+        /* nothing was created yet, so only the slot needs releasing */
         chnState[index].enable = false;
         HAL_ERROR("media", "Creating channel %d failed with %#x!\n%s\n",
             index, ret, errstr(ret));
@@ -670,6 +680,11 @@ int media_mp4_enable(void) {
 
         if (ret)
         {
+            /* The channel was created; release it before clearing the slot.
+             * media_*_disable() skips slots whose enable is already clear, so
+             * dropping the flag first would strand the channel in the HAL and
+             * still let take_next_free_channel() hand the index out again. */
+            media_video_disable(index, 0);
             chnState[index].enable = false;
             HAL_ERROR("media", "Creating encoder %d failed with %#x!\n%s\n",
                 index, ret, errstr(ret));
@@ -682,6 +697,9 @@ int media_mp4_enable(void) {
 
     if (ret = bind_channel(index, app_config.mp4_fps, 0))
     {
+        /* channel and encoder exist and nothing is bound, so drop the encoder
+         * (the teardown order in media_*_disable) before releasing the slot */
+        media_video_disable(index, 0);
         chnState[index].enable = false;
         HAL_ERROR("media", "Binding channel %d failed with %#x!\n%s\n",
             index, ret, errstr(ret));
