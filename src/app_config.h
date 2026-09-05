@@ -35,7 +35,10 @@ struct AppConfig {
     unsigned int check_interval_s;
     unsigned int pin_switch_delay_us;
     char adc_device[128];
+    char night_lamp[8];       /* ir (default), white (colour night vision), none */
     int adc_threshold;
+    int smartir_gain_night;   /* Fullhan SmartIR: image gain above which it is night (0 = library default) */
+    int smartir_gain_day;     /* ... and below which it is day again */
 
     // [isp]
     bool mirror;
@@ -60,6 +63,7 @@ struct AppConfig {
     char rtsp_auth_user[32];
     char rtsp_auth_pass[32];
     int rtsp_port;
+    char rtsp_audio_codec[8];   /* pcma (G.711 A-law, 8 kHz) or mp3 */
 
     // [record]
     bool record_enable;

@@ -98,11 +98,16 @@ int app_config_save(void) {
     fprintf(file, "  enable: %s\n", app_config.night_mode_enable ? "true" : "false");
     fprintf(file, "  ir_sensor_pin: %d\n", app_config.ir_sensor_pin);
     fprintf(file, "  check_interval_s: %d\n", app_config.check_interval_s);
+    if (app_config.smartir_gain_night || app_config.smartir_gain_day) {
+        fprintf(file, "  smartir_gain_night: %d\n", app_config.smartir_gain_night);
+        fprintf(file, "  smartir_gain_day: %d\n", app_config.smartir_gain_day);
+    }
     fprintf(file, "  ir_cut_pin1: %d\n", app_config.ir_cut_pin1);
     fprintf(file, "  ir_cut_pin2: %d\n", app_config.ir_cut_pin2);
     fprintf(file, "  ir_led_pin: %d\n", app_config.ir_led_pin);
     fprintf(file, "  pin_switch_delay_us: %d\n", app_config.pin_switch_delay_us);
     fprintf(file, "  adc_device: %s\n", app_config.adc_device);
+    fprintf(file, "  lamp: %s\n", app_config.night_lamp);
     fprintf(file, "  adc_threshold: %d\n", app_config.adc_threshold);
 
     fprintf(file, "isp:\n");
@@ -122,6 +127,7 @@ int app_config_save(void) {
     fprintf(file, "rtsp:\n");
     fprintf(file, "  enable: %s\n", app_config.rtsp_enable ? "true" : "false");
     fprintf(file, "  port: %d\n", app_config.rtsp_port);
+    fprintf(file, "  audio_codec: %s\n", app_config.rtsp_audio_codec);
     fprintf(file, "  enable_auth: %s\n", app_config.rtsp_enable_auth ? "true" : "false");
     fprintf(file, "  auth_user: %s\n", app_config.rtsp_auth_user);
     fprintf(file, "  auth_pass: %s\n", app_config.rtsp_auth_pass);
@@ -236,6 +242,7 @@ enum ConfigError app_config_parse(void) {
 
     app_config.rtsp_enable = false;
     app_config.rtsp_port = 554;
+    strcpy(app_config.rtsp_audio_codec, "mp3");   /* upstream default; the Fullhan image ships pcma in its yaml */
     app_config.rtsp_enable_auth = false;
     app_config.rtsp_auth_user[0] = '\0';
     app_config.rtsp_auth_pass[0] = '\0';
@@ -277,6 +284,7 @@ enum ConfigError app_config_parse(void) {
     app_config.pin_switch_delay_us = 250;
     app_config.check_interval_s = 10;
     app_config.adc_device[0] = 0;
+    strcpy(app_config.night_lamp, "ir");
     app_config.adc_threshold = 128;
 
     struct IniConfig ini;
@@ -344,11 +352,17 @@ enum ConfigError app_config_parse(void) {
     #define PIN_MAX 95
     if (app_config.night_mode_enable) {
         parse_int(
-            &ini, "night_mode", "ir_sensor_pin", 0, PIN_MAX,
+            &ini, "night_mode", "ir_sensor_pin", 0, 999, /* 999 = no sensor (the default) */
             &app_config.ir_sensor_pin);
         parse_int(
             &ini, "night_mode", "check_interval_s", 0, 600,
             &app_config.check_interval_s);
+        parse_int(
+            &ini, "night_mode", "smartir_gain_night", 0, 65535,
+            &app_config.smartir_gain_night);
+        parse_int(
+            &ini, "night_mode", "smartir_gain_day", 0, 65535,
+            &app_config.smartir_gain_day);
         parse_int(
             &ini, "night_mode", "ir_cut_pin1", 0, PIN_MAX,
             &app_config.ir_cut_pin1);
@@ -363,6 +377,17 @@ enum ConfigError app_config_parse(void) {
             &app_config.pin_switch_delay_us);
         parse_param_value(
             &ini, "night_mode", "adc_device", app_config.adc_device);
+        {
+            /* parse_param_value() sprintf()s into the caller's buffer with no
+             * size, so read into a temporary the size of the largest config
+             * string in this file and accept only the lamps the HAL drives. */
+            char lamp[128] = {0};
+            if (parse_param_value(&ini, "night_mode", "lamp", lamp) == CONFIG_OK &&
+                (EQUALS(lamp, "ir") || EQUALS(lamp, "white") || EQUALS(lamp, "none"))) {
+                strncpy(app_config.night_lamp, lamp, sizeof(app_config.night_lamp) - 1);
+                app_config.night_lamp[sizeof(app_config.night_lamp) - 1] = 0;
+            }
+        }
         parse_int(
             &ini, "night_mode", "adc_threshold", INT_MIN, INT_MAX,
             &app_config.adc_threshold);
@@ -432,6 +457,18 @@ enum ConfigError app_config_parse(void) {
 
     parse_bool(&ini, "rtsp", "enable", &app_config.rtsp_enable);
     parse_int(&ini, "rtsp", "port", 0, USHRT_MAX, &app_config.rtsp_port);
+    {
+        /* Bounded, and only the two codecs the RTP path implements: anything
+         * else would advertise a payload type nothing produces. */
+        char codec[16] = {0};
+        if (parse_param_value_n(&ini, "rtsp", "audio_codec", codec, sizeof(codec)) == CONFIG_OK) {
+            if (EQUALS(codec, "pcma") || EQUALS(codec, "mp3")) {
+                strncpy(app_config.rtsp_audio_codec, codec,
+                    sizeof(app_config.rtsp_audio_codec) - 1);
+                app_config.rtsp_audio_codec[sizeof(app_config.rtsp_audio_codec) - 1] = 0;
+            }
+        }
+    }
     if (app_config.rtsp_enable) {
         parse_bool(&ini, "rtsp", "enable_auth", &app_config.rtsp_enable_auth);
         parse_param_value(

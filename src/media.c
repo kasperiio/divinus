@@ -39,6 +39,67 @@ int save_audio_stream(hal_audframe *frame) {
     return EXIT_SUCCESS;
 }
 
+static unsigned char pcm_to_alaw(short pcm)
+{
+    int sign = (pcm & 0x8000) >> 8, s = sign ? -pcm - 1 : pcm, exp = 7;
+    if (s > 32635) s = 32635;
+    if (s >= 256) {
+        for (int m = 0x4000; !(s & m) && exp > 0; m >>= 1) exp--;
+        s = ((exp << 4) | ((s >> (exp + 3)) & 0x0f));
+    } else
+        s >>= 4;
+    return (unsigned char)((s ^ (sign ? 0xd5 : 0x55)));
+}
+
+/* RTSP G.711: resample the capture rate to 8 kHz (block average) and A-law
+ * encode, sending one RTP packet per 20 ms; MP3 keeps feeding the MP4/HTTP/RTMP
+ * outputs.
+ *
+ * The ratio is carried in 16.16 fixed point rather than as an integer divisor:
+ * srate is accepted anywhere in 8000..96000, and truncating 44100 / 8000 to 5
+ * emitted 8820 samples a second against an SDP and RTP clock of 8000, so the
+ * stream ran fast and the 160-byte packets were 18.1 ms rather than 20. */
+static void rtsp_pcma_feed(short *pcm, unsigned int samples)
+{
+    static unsigned char alaw[160];
+    static unsigned int fill, phase, step;
+    static int acc, accN;
+    if (!step) {
+        unsigned int srate = app_config.audio_srate > 0 ? app_config.audio_srate : 8000;
+        step = (srate << 16) / 8000;
+        if (!step) step = 1 << 16;
+    }
+    for (unsigned int i = 0; i < samples; i++) {
+        acc += pcm[i];
+        accN++;
+        phase += 1 << 16;
+        if (phase < step) continue;
+        phase -= step;
+        alaw[fill++] = pcm_to_alaw((short)(acc / accN));
+        acc = 0; accN = 0;
+        if (fill == sizeof(alaw)) {
+            rtp_send_pcma(rtspHandle, alaw, sizeof(alaw));
+            fill = 0;
+        }
+    }
+}
+
+/* The codec RTSP sessions were negotiated with.
+ *
+ * app_config.rtsp_audio_codec can be changed at runtime through /api/rtsp, but
+ * switching the payload type and clock under a live session would leave every
+ * client decoding the wrong thing without a new DESCRIBE/SETUP. The value the
+ * media path uses is therefore latched when the server starts, which is what
+ * the API means when it says the change applies after a restart. */
+static char rtspCodec[sizeof(app_config.rtsp_audio_codec)];
+
+void rtsp_latch_audio_codec(void) {
+    strncpy(rtspCodec, app_config.rtsp_audio_codec, sizeof(rtspCodec) - 1);
+    rtspCodec[sizeof(rtspCodec) - 1] = 0;
+}
+
+static char rtsp_pcma_active(void) { return EQUALS(rtspCodec, "pcma"); }
+
 void *aenc_thread(void) {
     static uint8_t frame_buf[AUD_FRAME_MAX + 2];
     const uint32_t mp3FrmSize =
@@ -56,7 +117,7 @@ void *aenc_thread(void) {
             pthread_mutex_lock(&mp4Mtx);
             mp4_ingest_audio(mp3Buf.buf, mp3FrmSize);
             pthread_mutex_unlock(&mp4Mtx);
-            if (app_config.rtsp_enable)
+            if (app_config.rtsp_enable && !rtsp_pcma_active())
                 rtp_send_mp3(rtspHandle, mp3Buf.buf, mp3FrmSize);
             rtmp_ingest_audio(mp3Buf.buf, mp3FrmSize);
             mp3Buf.offset -= mp3FrmSize;
@@ -83,6 +144,18 @@ void *aenc_thread(void) {
         outFrame.seq = seq++;
         outFrame.timestamp = millis();
         send_pcm_to_client(&outFrame);
+        if (app_config.rtsp_enable && rtsp_pcma_active())
+            rtsp_pcma_feed((short *)(frame_buf + 2), flen / 2);
+
+        /* The software MP3 encoder is the single most expensive thing on a
+         * small SoC (24% of an ARM1176 at 48 kHz); skip it while nothing
+         * consumes MP3: no HTTP MP3/MP4 client, no recording, no RTMP, and
+         * RTSP carrying G.711 */
+        if (!recordOn && !app_config.stream_enable && !http_audio_clients() &&
+            !(app_config.rtsp_enable && !rtsp_pcma_active())) {
+            pcmPos = 0;
+            continue;
+        }
 
         unsigned int pcmLen = flen / 2;
         short *pcmPack = (short *)(frame_buf + 2);
@@ -268,6 +341,9 @@ void request_idr(void) {
         case HAL_PLATFORM_V2:  v2_video_request_idr(index); break;
         case HAL_PLATFORM_V3:  v3_video_request_idr(index); break;
         case HAL_PLATFORM_V4:  v4_video_request_idr(index); break;
+#if __ARM_ARCH == 6
+        case HAL_PLATFORM_FH:  fh_video_request_idr(index); break;
+#endif
 #elif defined(__mips__)
         case HAL_PLATFORM_T31: t31_video_request_idr(index); break;
 #elif defined(__riscv) || defined(__riscv__)
@@ -291,6 +367,9 @@ void set_grayscale(bool active) {
         case HAL_PLATFORM_V2:  v2_channel_grayscale(active); break;
         case HAL_PLATFORM_V3:  v3_channel_grayscale(active); break;
         case HAL_PLATFORM_V4:  v4_channel_grayscale(active); break;
+#if __ARM_ARCH == 6
+        case HAL_PLATFORM_FH:  fh_channel_grayscale(active); break;
+#endif
 #elif defined(__mips__)
         case HAL_PLATFORM_T31: t31_channel_grayscale(active); break;
 #elif defined(__riscv) || defined(__riscv__)
@@ -332,6 +411,10 @@ int create_channel(char index, short width, short height, char framerate, char j
             app_config.mirror, app_config.flip, framerate);
         case HAL_PLATFORM_V4:  return v4_channel_create(index, app_config.mirror,
             app_config.flip, framerate);
+#if __ARM_ARCH == 6
+        case HAL_PLATFORM_FH:  return fh_channel_create(index, width, height,
+            framerate, jpeg);
+#endif
 #elif defined(__mips__)
         case HAL_PLATFORM_T31: return t31_channel_create(index, width, height,
             framerate, jpeg);
@@ -356,6 +439,9 @@ int bind_channel(char index, char framerate, char jpeg) {
         case HAL_PLATFORM_V2:  return v2_channel_bind(index);
         case HAL_PLATFORM_V3:  return v3_channel_bind(index);
         case HAL_PLATFORM_V4:  return v4_channel_bind(index);
+#if __ARM_ARCH == 6
+        case HAL_PLATFORM_FH:  return fh_channel_bind(index);
+#endif
 #elif defined(__mips__)
         case HAL_PLATFORM_T31: return t31_channel_bind(index);
 #elif defined(__riscv) || defined(__riscv__)
@@ -378,6 +464,9 @@ int unbind_channel(char index, char jpeg) {
         case HAL_PLATFORM_V2:  return v2_channel_unbind(index);
         case HAL_PLATFORM_V3:  return v3_channel_unbind(index);
         case HAL_PLATFORM_V4:  return v4_channel_unbind(index);
+#if __ARM_ARCH == 6
+        case HAL_PLATFORM_FH:  return fh_channel_unbind(index);
+#endif
 #elif defined(__mips__)
         case HAL_PLATFORM_T31: return t31_channel_unbind(index);
 #elif defined(__riscv) || defined(__riscv__)
@@ -400,6 +489,9 @@ int media_video_disable(char index, char jpeg) {
         case HAL_PLATFORM_V2:  return v2_video_destroy(index);
         case HAL_PLATFORM_V3:  return v3_video_destroy(index);
         case HAL_PLATFORM_V4:  return v4_video_destroy(index);
+#if __ARM_ARCH == 6
+        case HAL_PLATFORM_FH:  return fh_video_destroy(index);
+#endif
 #elif defined(__mips__)
         case HAL_PLATFORM_T31: return t31_video_destroy(index);
 #elif defined(__riscv) || defined(__riscv__)
@@ -431,6 +523,9 @@ void media_audio_disable(void) {
         case HAL_PLATFORM_V2:  v2_audio_deinit(); break;
         case HAL_PLATFORM_V3:  v3_audio_deinit(); break;
         case HAL_PLATFORM_V4:  v4_audio_deinit(); break;
+#if __ARM_ARCH == 6
+        case HAL_PLATFORM_FH:  fh_audio_deinit(); break;
+#endif
 #elif defined(__mips__)
         case HAL_PLATFORM_T31: t31_audio_deinit(); break;
 #elif defined(__riscv) || defined(__riscv__)
@@ -459,6 +554,9 @@ int media_audio_enable(void) {
         case HAL_PLATFORM_V2:  ret = v2_audio_init(app_config.audio_srate); break;
         case HAL_PLATFORM_V3:  ret = v3_audio_init(app_config.audio_srate); break;
         case HAL_PLATFORM_V4:  ret = v4_audio_init(app_config.audio_srate); break;
+#if __ARM_ARCH == 6
+        case HAL_PLATFORM_FH:  ret = fh_audio_init(app_config.audio_srate); break;
+#endif
 #elif defined(__mips__)
         case HAL_PLATFORM_T31: ret = t31_audio_init(app_config.audio_srate); break;
 #elif defined(__riscv) || defined(__riscv__)
@@ -548,8 +646,12 @@ int media_mjpeg_enable(void) {
 
     if (ret = create_channel(index, app_config.mjpeg_width,
         app_config.mjpeg_height, app_config.mjpeg_fps, 1))
+    {
+        /* nothing was created yet, so only the slot needs releasing */
+        chnState[index].enable = false;
         HAL_ERROR("media", "Creating channel %d failed with %#x!\n%s\n",
             index, ret, errstr(ret));
+    }
 
     {
         hal_vidconfig config;
@@ -574,6 +676,9 @@ int media_mjpeg_enable(void) {
             case HAL_PLATFORM_V2:  ret = v2_video_create(index, &config); break;
             case HAL_PLATFORM_V3:  ret = v3_video_create(index, &config); break;
             case HAL_PLATFORM_V4:  ret = v4_video_create(index, &config); break;
+#if __ARM_ARCH == 6
+            case HAL_PLATFORM_FH:  ret = fh_video_create(index, &config); break;
+#endif
 #elif defined(__mips__)
             case HAL_PLATFORM_T31: ret = t31_video_create(index, &config); break;
 #elif defined(__riscv) || defined(__riscv__)
@@ -582,13 +687,27 @@ int media_mjpeg_enable(void) {
         }
 
         if (ret)
+        {
+            /* The channel was created; release it before clearing the slot.
+             * media_*_disable() skips slots whose enable is already clear, so
+             * dropping the flag first would strand the channel in the HAL and
+             * still let take_next_free_channel() hand the index out again. */
+            media_video_disable(index, 1);
+            chnState[index].enable = false;
             HAL_ERROR("media", "Creating encoder %d failed with %#x!\n%s\n",
                 index, ret, errstr(ret));
+        }
     }
 
     if (ret = bind_channel(index, app_config.mjpeg_fps, 1))
+    {
+        /* channel and encoder exist and nothing is bound, so drop the encoder
+         * (the teardown order in media_*_disable) before releasing the slot */
+        media_video_disable(index, 1);
+        chnState[index].enable = false;
         HAL_ERROR("media", "Binding channel %d failed with %#x!\n%s\n",
             index, ret, errstr(ret));
+    }
 
     return EXIT_SUCCESS;
 }
@@ -620,8 +739,12 @@ int media_mp4_enable(void) {
 
     if (ret = create_channel(index, app_config.mp4_width,
         app_config.mp4_height, app_config.mp4_fps, 0))
+    {
+        /* nothing was created yet, so only the slot needs releasing */
+        chnState[index].enable = false;
         HAL_ERROR("media", "Creating channel %d failed with %#x!\n%s\n",
             index, ret, errstr(ret));
+    }
 
     {
         hal_vidconfig config;
@@ -649,6 +772,9 @@ int media_mp4_enable(void) {
             case HAL_PLATFORM_V2:  ret = v2_video_create(index, &config); break;
             case HAL_PLATFORM_V3:  ret = v3_video_create(index, &config); break;
             case HAL_PLATFORM_V4:  ret = v4_video_create(index, &config); break;
+#if __ARM_ARCH == 6
+            case HAL_PLATFORM_FH:  ret = fh_video_create(index, &config); break;
+#endif
 #elif defined(__mips__)
             case HAL_PLATFORM_T31: ret = t31_video_create(index, &config); break;
 #elif defined(__riscv) || defined(__riscv__)
@@ -657,8 +783,16 @@ int media_mp4_enable(void) {
         }
 
         if (ret)
+        {
+            /* The channel was created; release it before clearing the slot.
+             * media_*_disable() skips slots whose enable is already clear, so
+             * dropping the flag first would strand the channel in the HAL and
+             * still let take_next_free_channel() hand the index out again. */
+            media_video_disable(index, 0);
+            chnState[index].enable = false;
             HAL_ERROR("media", "Creating encoder %d failed with %#x!\n%s\n",
                 index, ret, errstr(ret));
+        }
 
         mp4_set_config(app_config.mp4_width, app_config.mp4_height, app_config.mp4_fps,
             app_config.audio_enable ? HAL_AUDCODEC_MP3 : HAL_AUDCODEC_UNSPEC,
@@ -666,8 +800,14 @@ int media_mp4_enable(void) {
     }
 
     if (ret = bind_channel(index, app_config.mp4_fps, 0))
+    {
+        /* channel and encoder exist and nothing is bound, so drop the encoder
+         * (the teardown order in media_*_disable) before releasing the slot */
+        media_video_disable(index, 0);
+        chnState[index].enable = false;
         HAL_ERROR("media", "Binding channel %d failed with %#x!\n%s\n",
             index, ret, errstr(ret));
+    }
 
     return EXIT_SUCCESS;
 }
@@ -689,6 +829,9 @@ int sdk_start(void) {
         case HAL_PLATFORM_V2:  ret = v2_hal_init(); break;
         case HAL_PLATFORM_V3:  ret = v3_hal_init(); break;
         case HAL_PLATFORM_V4:  ret = v4_hal_init(); break;
+#if __ARM_ARCH == 6
+        case HAL_PLATFORM_FH:  ret = fh_hal_init(); break;
+#endif
 #elif defined(__mips__)
         case HAL_PLATFORM_T31: ret = t31_hal_init(); break;
 #elif defined(__riscv) || defined(__riscv__)
@@ -738,6 +881,12 @@ int sdk_start(void) {
             v4_aud_cb = save_audio_stream;
             v4_vid_cb = save_video_stream;
             break;
+#if __ARM_ARCH == 6
+        case HAL_PLATFORM_FH:
+            fh_aud_cb = save_audio_stream;
+            fh_vid_cb = save_video_stream;
+            break;
+#endif
 #elif defined(__mips__)
         case HAL_PLATFORM_T31:
             t31_aud_cb = save_audio_stream;
@@ -765,6 +914,9 @@ int sdk_start(void) {
         case HAL_PLATFORM_V2:  ret = v2_system_init(app_config.sensor_config); break;
         case HAL_PLATFORM_V3:  ret = v3_system_init(app_config.sensor_config); break;
         case HAL_PLATFORM_V4:  ret = v4_system_init(app_config.sensor_config); break;
+#if __ARM_ARCH == 6
+        case HAL_PLATFORM_FH:  ret = fh_system_init(app_config.sensor_config); break;
+#endif
 #elif defined(__mips__)
         case HAL_PLATFORM_T31: ret = t31_system_init(); break;
 #elif defined(__riscv) || defined(__riscv__)
@@ -777,9 +929,18 @@ int sdk_start(void) {
 
     if (app_config.audio_enable) {
         ret = media_audio_enable();
-        if (ret)
+        if (ret) {
+#if defined(__arm__) && !defined(__ARM_PCS_VFP) && __ARM_ARCH == 6
+            /* Fullhan only: a broken mic/audio config must not abort the SDK start,
+             * which on this watchdog-guarded SoC means a reboot loop */
+            HAL_WARNING("media", "Audio initialization failed with %#x, continuing without audio!\n%s\n",
+                ret, errstr(ret));
+            app_config.audio_enable = false;
+#else
             HAL_ERROR("media", "Audio initialization failed with %#x!\n%s\n",
                 ret, errstr(ret));
+#endif
+        }
     }
 
     short width = MAX(app_config.mp4_width, app_config.mjpeg_width);
@@ -804,6 +965,10 @@ int sdk_start(void) {
         case HAL_PLATFORM_V2:  ret = v2_pipeline_create(); break;
         case HAL_PLATFORM_V3:  ret = v3_pipeline_create(); break;
         case HAL_PLATFORM_V4:  ret = v4_pipeline_create(); break;
+#if __ARM_ARCH == 6
+        case HAL_PLATFORM_FH:  ret = fh_pipeline_create(width, height,
+            app_config.mirror, app_config.flip, framerate, app_config.antiflicker); break;
+#endif
 #elif defined(__mips__)
         case HAL_PLATFORM_T31: ret = t31_pipeline_create(app_config.mirror,
             app_config.flip, app_config.antiflicker, framerate); break;
@@ -863,6 +1028,8 @@ int sdk_start(void) {
             case HAL_PLATFORM_I6:  i6_config_load(app_config.sensor_config); break;
             case HAL_PLATFORM_I6C: i6c_config_load(app_config.sensor_config); break;
             case HAL_PLATFORM_M6:  m6_config_load(app_config.sensor_config); break;
+#elif defined(__arm__) && !defined(__ARM_PCS_VFP) && __ARM_ARCH == 6
+            case HAL_PLATFORM_FH:  fh_config_load(app_config.sensor_config); break;
 #elif defined(__mips__)
             case HAL_PLATFORM_T31: t31_config_load(app_config.sensor_config); break;
 #endif
@@ -892,6 +1059,9 @@ int sdk_stop(void) {
         case HAL_PLATFORM_V2:  v2_video_destroy_all(); break;
         case HAL_PLATFORM_V3:  v3_video_destroy_all(); break;
         case HAL_PLATFORM_V4:  v4_video_destroy_all(); break;
+#if __ARM_ARCH == 6
+        case HAL_PLATFORM_FH:  fh_video_destroy_all(); break;
+#endif
 #elif defined(__mips__)
         case HAL_PLATFORM_T31: t31_video_destroy_all(); break;
 #elif defined(__riscv) || defined(__riscv__)
@@ -912,6 +1082,9 @@ int sdk_stop(void) {
         case HAL_PLATFORM_V2:  v2_pipeline_destroy(); break;
         case HAL_PLATFORM_V3:  v3_pipeline_destroy(); break;
         case HAL_PLATFORM_V4:  v4_pipeline_destroy(); break;
+#if __ARM_ARCH == 6
+        case HAL_PLATFORM_FH:  fh_pipeline_destroy(); break;
+#endif
 #elif defined(__mips__)
         case HAL_PLATFORM_T31: t31_pipeline_destroy(); break;
 #elif defined(__riscv) || defined(__riscv__)
@@ -939,6 +1112,9 @@ int sdk_stop(void) {
         case HAL_PLATFORM_V2:  v2_system_deinit(); break;
         case HAL_PLATFORM_V3:  v3_system_deinit(); break;
         case HAL_PLATFORM_V4:  v4_system_deinit(); break;
+#if __ARM_ARCH == 6
+        case HAL_PLATFORM_FH:  fh_system_deinit(); break;
+#endif
 #elif defined(__mips__)
         case HAL_PLATFORM_T31: t31_system_deinit(); break;
 #elif defined(__riscv) || defined(__riscv__)
@@ -969,6 +1145,9 @@ int sdk_stop(void) {
         case HAL_PLATFORM_V2:  v2_hal_deinit(); break;
         case HAL_PLATFORM_V3:  v3_hal_deinit(); break;
         case HAL_PLATFORM_V4:  v4_hal_deinit(); break;
+#if __ARM_ARCH == 6
+        case HAL_PLATFORM_FH:  fh_hal_deinit(); break;
+#endif
 #elif defined(__mips__)
         case HAL_PLATFORM_T31: t31_hal_deinit(); break;
 #elif defined(__riscv) || defined(__riscv__)
