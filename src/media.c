@@ -548,8 +548,11 @@ int media_mjpeg_enable(void) {
 
     if (ret = create_channel(index, app_config.mjpeg_width,
         app_config.mjpeg_height, app_config.mjpeg_fps, 1))
+    {
+        chnState[index].enable = false;
         HAL_ERROR("media", "Creating channel %d failed with %#x!\n%s\n",
             index, ret, errstr(ret));
+    }
 
     {
         hal_vidconfig config;
@@ -582,13 +585,19 @@ int media_mjpeg_enable(void) {
         }
 
         if (ret)
+        {
+            chnState[index].enable = false;
             HAL_ERROR("media", "Creating encoder %d failed with %#x!\n%s\n",
                 index, ret, errstr(ret));
+        }
     }
 
     if (ret = bind_channel(index, app_config.mjpeg_fps, 1))
+    {
+        chnState[index].enable = false;
         HAL_ERROR("media", "Binding channel %d failed with %#x!\n%s\n",
             index, ret, errstr(ret));
+    }
 
     return EXIT_SUCCESS;
 }
@@ -620,8 +629,11 @@ int media_mp4_enable(void) {
 
     if (ret = create_channel(index, app_config.mp4_width,
         app_config.mp4_height, app_config.mp4_fps, 0))
+    {
+        chnState[index].enable = false;
         HAL_ERROR("media", "Creating channel %d failed with %#x!\n%s\n",
             index, ret, errstr(ret));
+    }
 
     {
         hal_vidconfig config;
@@ -657,8 +669,11 @@ int media_mp4_enable(void) {
         }
 
         if (ret)
+        {
+            chnState[index].enable = false;
             HAL_ERROR("media", "Creating encoder %d failed with %#x!\n%s\n",
                 index, ret, errstr(ret));
+        }
 
         mp4_set_config(app_config.mp4_width, app_config.mp4_height, app_config.mp4_fps,
             app_config.audio_enable ? HAL_AUDCODEC_MP3 : HAL_AUDCODEC_UNSPEC,
@@ -666,8 +681,11 @@ int media_mp4_enable(void) {
     }
 
     if (ret = bind_channel(index, app_config.mp4_fps, 0))
+    {
+        chnState[index].enable = false;
         HAL_ERROR("media", "Binding channel %d failed with %#x!\n%s\n",
             index, ret, errstr(ret));
+    }
 
     return EXIT_SUCCESS;
 }

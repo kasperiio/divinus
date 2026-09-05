@@ -873,7 +873,7 @@ void respond_request(http_request_t *req) {
                 char *key = split(&value, "=");
                 if (!key || !*key || !value || !*value) continue;
                 if (EQUALS(key, "bitrate")) {
-                    short result = strtol(value, &remain, 10);
+                    int result = strtol(value, &remain, 10);
                     if (remain != value)
                         app_config.audio_bitrate = result;
                 } else if (EQUALS(key, "enable")) {
@@ -882,11 +882,11 @@ void respond_request(http_request_t *req) {
                     else if (EQUALS_CASE(value, "false") || EQUALS(value, "0"))
                         app_config.audio_enable = 0;
                 } else if (EQUALS(key, "gain")) {
-                    short result = strtol(value, &remain, 10);
+                    int result = strtol(value, &remain, 10);
                     if (remain != value)
                         app_config.audio_gain = result;
                 } else if (EQUALS(key, "srate")) {
-                    short result = strtol(value, &remain, 10);
+                    int result = strtol(value, &remain, 10);
                     if (remain != value)
                         app_config.audio_srate = result;
                 }
@@ -1265,7 +1265,7 @@ void respond_request(http_request_t *req) {
         }
         if (EQUALS(req->method, "POST")) {
             char *type = request_header("Content-Type");
-            if (STARTS_WITH(type, "multipart/form-data")) {
+            if (type && STARTS_WITH(type, "multipart/form-data")) {
                 char *bound = strstr(type, "boundary=") + strlen("boundary=");
 
                 char *payloadb = strstr(req->payload, bound);

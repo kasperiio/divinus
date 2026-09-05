@@ -20,6 +20,9 @@ static inline int __rtcp_send_sr(struct connection_item_t *con, int track_id);
  ******************************************************************************/
 static inline int __rtcp_send_sr(struct connection_item_t *con, int track_id)
 {
+    /* A track without a transport (never SETUP) has fd 0, which is stdin */
+    if (!con->trans[track_id].server_port_rtp && !con->trans[track_id].is_tcp) return SUCCESS;
+
     struct timeval tv;
     unsigned int ts_h, ts_l;
     int send_bytes;
