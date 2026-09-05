@@ -47,11 +47,12 @@ typedef struct {
     unsigned int stride;        /* bytes per line */
 } fh_vpss_graph;
 #define FH_OSD_MAX 8
-typedef struct { char used; hal_rect rect; } fh_osd_rgn;
+typedef struct { char used; hal_rect rect; unsigned char opal; } fh_osd_rgn;
 static fh_osd_rgn _fh_osd[FH_OSD_MAX];
 static unsigned int _fh_osd_phys, _fh_osd_size;
 static unsigned short *_fh_osd_virt;
 static char _fh_osd_on;
+static unsigned char _fh_osd_alpha = 255;
 static pthread_mutex_t _fh_strm_mtx = PTHREAD_MUTEX_INITIALIZER;
 static char _fh_aud_on;
 static unsigned int _fh_aud_frame, _fh_aud_rate;
@@ -600,7 +601,7 @@ static int fh_osd_setup(void)
     memset(&graph, 0, sizeof(graph));
     graph.enable = 1;
     graph.physAddr = _fh_osd_phys;
-    graph.alpha = 255;
+    graph.alpha = _fh_osd_alpha;
     graph.width = _fh_snr_dim.width;
     graph.height = _fh_snr_dim.height;
     graph.stride = _fh_snr_dim.width * 2;
@@ -608,6 +609,37 @@ static int fh_osd_setup(void)
         HAL_ERROR("fh_osd", "Enabling the overlay plane failed with %#x!\n", ret);
     _fh_osd_on = 1;
     return EXIT_SUCCESS;
+}
+
+/*
+ * The hardware carries one alpha for the whole graphics plane, and the pixel
+ * format is ARGB1555 whose alpha bit only says opaque or transparent, so a
+ * per-region opacity cannot be honoured individually. Apply the highest
+ * opacity any active region asks for: a region is then never more transparent
+ * than configured, and with the usual single OSD region it is exact.
+ */
+static void fh_osd_apply_alpha(void)
+{
+    int (*fnSetGraph)(fh_vpss_graph *) = dlsym(fh_vpss.handle, "FH_VPSS_SetGraph");
+    fh_vpss_graph graph;
+    unsigned char alpha = 0;
+    int any = 0;
+
+    for (int i = 0; i < FH_OSD_MAX; i++)
+        if (_fh_osd[i].used) { any = 1; if (_fh_osd[i].opal > alpha) alpha = _fh_osd[i].opal; }
+    if (!any) alpha = 255;
+    if (!_fh_osd_on || !fnSetGraph || alpha == _fh_osd_alpha) { _fh_osd_alpha = alpha; return; }
+
+    _fh_osd_alpha = alpha;
+    memset(&graph, 0, sizeof(graph));
+    graph.enable = 1;
+    graph.physAddr = _fh_osd_phys;
+    graph.alpha = _fh_osd_alpha;
+    graph.width = _fh_snr_dim.width;
+    graph.height = _fh_snr_dim.height;
+    graph.stride = _fh_snr_dim.width * 2;
+    if (fnSetGraph(&graph))
+        HAL_WARNING("fh_osd", "Could not set the overlay alpha to %u\n", _fh_osd_alpha);
 }
 
 /* divinus positions regions in main-stream pixels; the plane is at sensor size */
@@ -621,11 +653,22 @@ static void fh_osd_scale(hal_rect *rect)
 
 static void fh_osd_clear(hal_rect rect)
 {
+    unsigned int w;
+
+    /* rect.x/y are unsigned short and OSD positions are only range-checked
+     * against SHRT_MAX, so a region placed past the plane made
+     * _fh_snr_dim.width - rect.x wrap and memset most of memory. Reject the
+     * rectangle before it is used to derive any width or offset. */
+    if (!_fh_osd_virt) return;
+    if (rect.x >= _fh_snr_dim.width || rect.y >= _fh_snr_dim.height) return;
+
+    w = rect.width;
+    if ((unsigned int)rect.x + w > _fh_snr_dim.width)
+        w = _fh_snr_dim.width - rect.x;
+
     for (unsigned int y = 0; y < rect.height; y++) {
-        unsigned int py = rect.y + y;
+        unsigned int py = (unsigned int)rect.y + y;
         if (py >= _fh_snr_dim.height) break;
-        unsigned int w = rect.width;
-        if (rect.x + w > _fh_snr_dim.width) w = _fh_snr_dim.width - rect.x;
         memset(_fh_osd_virt + py * _fh_snr_dim.width + rect.x, 0, w * 2);
     }
 }
@@ -646,6 +689,8 @@ int fh_region_create(int *handle, hal_rect rect, short opacity)
     fh_osd_scale(&rect);
     _fh_osd[*handle].used = 1;
     _fh_osd[*handle].rect = rect;
+    _fh_osd[*handle].opal = opacity < 0 ? 0 : (opacity > 255 ? 255 : (unsigned char)opacity);
+    fh_osd_apply_alpha();
     return EXIT_SUCCESS;
 }
 
@@ -655,6 +700,7 @@ void fh_region_destroy(int *handle)
     fh_osd_clear(_fh_osd[*handle].rect);
     _fh_osd[*handle].used = 0;
     *handle = -1;
+    fh_osd_apply_alpha();
 }
 
 /* Bitmaps arrive as BGR555LE; set the alpha bit for opaque pixels (ARGB1555) */
@@ -665,15 +711,35 @@ int fh_region_setbitmap(int *handle, hal_bitmap *bitmap)
         return EXIT_FAILURE;
     fh_osd_rgn *rgn = &_fh_osd[*handle];
     fh_osd_clear(rgn->rect);
-    rgn->rect.width = bitmap->dim.width;
-    rgn->rect.height = bitmap->dim.height;
+    if (rgn->rect.x >= _fh_snr_dim.width || rgn->rect.y >= _fh_snr_dim.height)
+        return EXIT_SUCCESS;
+
+    /* The bitmap is rendered in main-stream pixels while this plane covers the
+     * whole sensor frame, so it is scaled by the same ratio fh_osd_scale()
+     * applies to the position. Scaling only the position left the overlay
+     * placed for one resolution and drawn at another whenever the main stream
+     * was smaller than the sensor. Nearest neighbour is enough for OSD text. */
+    unsigned int sw = _fh_vpss_dim[0].width ? _fh_vpss_dim[0].width : _fh_snr_dim.width;
+    unsigned int sh = _fh_vpss_dim[0].height ? _fh_vpss_dim[0].height : _fh_snr_dim.height;
+    unsigned int bw = bitmap->dim.width, bh = bitmap->dim.height;
+    unsigned int dw = bw * _fh_snr_dim.width / sw;
+    unsigned int dh = bh * _fh_snr_dim.height / sh;
+    if (!bw || !bh) return EXIT_SUCCESS;
+    if (!dw) dw = 1;
+    if (!dh) dh = 1;
+    if (dw > 0xffff) dw = 0xffff;
+    if (dh > 0xffff) dh = 0xffff;
+
+    rgn->rect.width = dw;
+    rgn->rect.height = dh;
     unsigned short *src = bitmap->data;
-    for (unsigned int y = 0; y < bitmap->dim.height; y++) {
-        unsigned int py = rgn->rect.y + y;
+    for (unsigned int y = 0; y < dh; y++) {
+        unsigned int py = (unsigned int)rgn->rect.y + y;
         if (py >= _fh_snr_dim.height) break;
+        unsigned int sy = y * bh / dh;
         unsigned short *dst = _fh_osd_virt + py * _fh_snr_dim.width + rgn->rect.x;
-        for (unsigned int x = 0; x < bitmap->dim.width && rgn->rect.x + x < _fh_snr_dim.width; x++) {
-            unsigned short p = src[y * bitmap->dim.width + x];
+        for (unsigned int x = 0; x < dw && (unsigned int)rgn->rect.x + x < _fh_snr_dim.width; x++) {
+            unsigned short p = src[sy * bw + (x * bw / dw)];
             dst[x] = p ? (p | 0x8000) : 0;
         }
     }
@@ -844,7 +910,15 @@ int fh_video_snapshot_grab(signed char index, hal_jpegdata *jpeg)
             pthread_mutex_lock(&_fh_mjpeg_mtx);
             if (_fh_mjpeg_len) {
                 if (_fh_mjpeg_len > jpeg->length) {
-                    jpeg->data = realloc(jpeg->data, _fh_mjpeg_len);
+                    /* keep the old buffer if this fails; assigning the result
+                     * straight to jpeg->data leaked it and then memcpy'd NULL */
+                    unsigned char *grown = realloc(jpeg->data, _fh_mjpeg_len);
+                    if (!grown) {
+                        pthread_mutex_unlock(&_fh_mjpeg_mtx);
+                        HAL_ERROR("fh_venc", "Growing the snapshot buffer to %u bytes failed!\n",
+                            _fh_mjpeg_len);
+                    }
+                    jpeg->data = grown;
                     jpeg->length = _fh_mjpeg_len;
                 }
                 memcpy(jpeg->data, _fh_mjpeg_cache, _fh_mjpeg_len);
@@ -885,14 +959,34 @@ int fh_video_snapshot_grab(signed char index, hal_jpegdata *jpeg)
         /* JPEG: base = data address, frameType = length. MJPEG: NALU-style packets. */
         if (type == FH_VENC_TYPE_JPEG) {
             unsigned int len = strm.frameType;
-            if (len > jpeg->length) { jpeg->data = realloc(jpeg->data, len); jpeg->length = len; }
+            if (len > jpeg->length) {
+                unsigned char *grown = realloc(jpeg->data, len);
+                if (!grown) {
+                    HAL_DANGER("fh_venc", "Growing the snapshot buffer to %u bytes failed!\n", len);
+                    fh_venc.fnReleaseStream(strm.channel);
+                    ret = EXIT_FAILURE;
+                    goto abort;
+                }
+                jpeg->data = grown;
+                jpeg->length = len;
+            }
             memcpy(jpeg->data, (void*)strm.base, len);
             jpeg->jpegSize = len;
         } else {
             unsigned int total = 0;
             for (unsigned int i = 0; i < strm.naluCount && i < 28; i++)
                 total += strm.nalu[i].length;
-            if (total > jpeg->length) { jpeg->data = realloc(jpeg->data, total); jpeg->length = total; }
+            if (total > jpeg->length) {
+                unsigned char *grown = realloc(jpeg->data, total);
+                if (!grown) {
+                    HAL_DANGER("fh_venc", "Growing the snapshot buffer to %u bytes failed!\n", total);
+                    fh_venc.fnReleaseStream(strm.channel);
+                    ret = EXIT_FAILURE;
+                    goto abort;
+                }
+                jpeg->data = grown;
+                jpeg->length = total;
+            }
             jpeg->jpegSize = 0;
             for (unsigned int i = 0; i < strm.naluCount && i < 28; i++) {
                 memcpy(jpeg->data + jpeg->jpegSize, (void*)strm.nalu[i].addr, strm.nalu[i].length);

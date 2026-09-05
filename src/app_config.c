@@ -375,8 +375,17 @@ enum ConfigError app_config_parse(void) {
             &app_config.pin_switch_delay_us);
         parse_param_value(
             &ini, "night_mode", "adc_device", app_config.adc_device);
-        parse_param_value(
-            &ini, "night_mode", "lamp", app_config.night_lamp);
+        {
+            /* parse_param_value() sprintf()s into the caller's buffer with no
+             * size, so read into a temporary the size of the largest config
+             * string in this file and accept only the lamps the HAL drives. */
+            char lamp[128] = {0};
+            if (parse_param_value(&ini, "night_mode", "lamp", lamp) == CONFIG_OK &&
+                (EQUALS(lamp, "ir") || EQUALS(lamp, "white") || EQUALS(lamp, "none"))) {
+                strncpy(app_config.night_lamp, lamp, sizeof(app_config.night_lamp) - 1);
+                app_config.night_lamp[sizeof(app_config.night_lamp) - 1] = 0;
+            }
+        }
         parse_int(
             &ini, "night_mode", "adc_threshold", INT_MIN, INT_MAX,
             &app_config.adc_threshold);
